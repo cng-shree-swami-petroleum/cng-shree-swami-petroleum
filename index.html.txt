@@ -1,0 +1,684 @@
+import { useState, useEffect, useMemo } from "react";
+
+const FONT = "'Inter','Segoe UI',system-ui,sans-serif";
+const MACHINES = ["1","2"];
+const MACHINE_COLORS = {
+  "1":{ bg:"#0f4c81", accent:"#3b9edd", light:"#e8f4fd" },
+  "2":{ bg:"#1a6644", accent:"#34c678", light:"#e6f7ef" },
+};
+const PAYMENT_METHODS = ["Cash","PhonePay / GPay","Credit Card","Debit Card","Petrocard"];
+const SHIFTS = ["Morning","Afternoon","Night"];
+const SHIFT_COLORS = { Morning:"#f57f17", Afternoon:"#1a6644", Night:"#7b2d8b" };
+const STORAGE_KEY = "cng_secure_v4";
+const DEFAULT_CNG_RATE = 90;
+const STATION_TITLE_DEFAULT = "CNG Shree Swami Petroleum";
+
+const DEFAULT_USERS = [
+  { username:"admin",     password:"ShrishaSonawane@2024", role:"admin",    displayName:"Administrator" },
+  { username:"operator1", password:"op1pass",              role:"operator", displayName:"Operator 1" },
+  { username:"operator2", password:"op2pass",              role:"operator", displayName:"Operator 2" },
+  { username:"manager",   password:"mgr2024",              role:"manager",  displayName:"Station Manager" },
+];
+
+function mergeUsers(stored){
+  if(!stored||!stored.length) return DEFAULT_USERS;
+  const m=[...DEFAULT_USERS];
+  stored.forEach(su=>{
+    if(!m.find(d=>d.username===su.username)) m.push(su);
+    else if(su.username!=="admin"){ const i=m.findIndex(d=>d.username===su.username); m[i]={...m[i],...su}; }
+  });
+  return m;
+}
+
+// ── logo ──────────────────────────────────────────────────────────────────────
+function SwamiBadge({ size=48 }){
+  const rays=[0,30,60,90,120,150,180,210,240,270,300,330];
+  return(
+    <svg width={size} height={size} viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <radialGradient id="sbg" cx="50%" cy="50%" r="50%"><stop offset="0%" stopColor="#ff9800"/><stop offset="100%" stopColor="#e65100"/></radialGradient>
+        <radialGradient id="sgl" cx="50%" cy="40%" r="60%"><stop offset="0%" stopColor="#fff9c4" stopOpacity="0.9"/><stop offset="100%" stopColor="#ff9800" stopOpacity="0"/></radialGradient>
+      </defs>
+      <circle cx="24" cy="24" r="23" fill="url(#sbg)" stroke="#fff" strokeWidth="1.5"/>
+      <circle cx="24" cy="24" r="20" fill="url(#sgl)"/>
+      {rays.map(deg=>{ const r=deg*Math.PI/180,x1=24+16*Math.sin(r),y1=24-16*Math.cos(r),x2=24+21*Math.sin(r),y2=24-21*Math.cos(r); return <line key={deg} x1={x1} y1={y1} x2={x2} y2={y2} stroke="#fff9c4" strokeWidth="1" strokeOpacity="0.7"/>; })}
+      <text x="24" y="22" textAnchor="middle" fontSize="16" fontWeight="bold" fill="#fff" fontFamily="serif">ॐ</text>
+      <text x="24" y="33" textAnchor="middle" fontSize="7" fontWeight="900" fill="#fff" fontFamily="sans-serif" letterSpacing="1">SWAMI</text>
+    </svg>
+  );
+}
+
+// ── data helpers ──────────────────────────────────────────────────────────────
+function emptyMeter(opening=""){ return { opening, closing:"" }; }
+function emptyShiftEntry(machineId, shift, openA="", openB=""){
+  return { machineId, shift, employeeName:"", employeeId:"", meters:{ A:emptyMeter(openA), B:emptyMeter(openB) }, payments:Object.fromEntries(PAYMENT_METHODS.map(p=>[p,""])), shortage:"", notes:"" };
+}
+function getEntry(entries, machineId, shift){ return entries.find(e=>e.machineId===machineId&&e.shift===shift)||null; }
+function getLastClosingBeforeDate(allRecords, machineId, beforeDate){
+  const prev=allRecords.filter(r=>r.date<beforeDate).sort((a,b)=>b.date.localeCompare(a.date));
+  for(const rec of prev){
+    for(let i=SHIFTS.length-1;i>=0;i--){
+      const e=(rec.entries||[]).find(e=>e.machineId===machineId&&e.shift===SHIFTS[i]);
+      if(e&&(e.meters.A.closing||e.meters.B.closing)) return{ A:e.meters.A.closing||"", B:e.meters.B.closing||"" };
+    }
+  }
+  return null;
+}
+function getPrevClosingSameDay(entries, machineId, shift){
+  const idx=SHIFTS.indexOf(shift);
+  for(let i=idx-1;i>=0;i--){
+    const e=entries.find(en=>en.machineId===machineId&&en.shift===SHIFTS[i]);
+    if(e&&(e.meters.A.closing||e.meters.B.closing)) return{ A:e.meters.A.closing||"", B:e.meters.B.closing||"", shift:SHIFTS[i] };
+  }
+  return null;
+}
+function isEntryEmpty(e){ if(!e)return true; const hc=(parseFloat(e.meters.A.closing)||0)>0||(parseFloat(e.meters.B.closing)||0)>0,hp=Object.values(e.payments).some(v=>(parseFloat(v)||0)>0); return !hc&&!hp&&!(parseFloat(e.shortage)||0); }
+function calcMeterSale(m){ const o=parseFloat(m.opening)||0,c=parseFloat(m.closing)||0; return c>=o?+(c-o).toFixed(2):0; }
+function calcEntrySale(e){ return +(calcMeterSale(e.meters.A)+calcMeterSale(e.meters.B)).toFixed(2); }
+function calcEntryCollection(e){ return +Object.values(e.payments).reduce((s,v)=>s+(parseFloat(v)||0),0).toFixed(2); }
+function calcEntryShortage(e){ return parseFloat(e.shortage)||0; }
+function nowISO(){ return new Date().toISOString(); }
+function todayStr(){ return new Date().toISOString().split("T")[0]; }
+function isToday(dateStr){ const t=new Date(),d=new Date(dateStr+"T00:00:00"); return d.getFullYear()===t.getFullYear()&&d.getMonth()===t.getMonth()&&d.getDate()===t.getDate(); }
+function isFutureDate(dateStr){ const t=new Date(); t.setHours(0,0,0,0); return new Date(dateStr+"T00:00:00")>t; }
+function fmtDate(d){ if(!d)return"—"; return new Date(d+"T00:00:00").toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}); }
+function fmtDT(iso){ if(!iso)return"—"; return new Date(iso).toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}); }
+
+// ── style helpers ─────────────────────────────────────────────────────────────
+const inp=(x={})=>({ width:"100%",boxSizing:"border-box",border:"1.5px solid #dde3ec",borderRadius:9,padding:"9px 13px",fontSize:13.5,fontFamily:FONT,color:"#1a2740",background:"#f7f9fc",outline:"none",transition:"border-color 0.2s",...x });
+const lbl=(color="#5a6a85")=>({ fontSize:10.5,fontWeight:700,color,letterSpacing:1.2,textTransform:"uppercase",display:"block",marginBottom:5 });
+const sHead=(icon,txt)=><div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:12,display:"flex",alignItems:"center",gap:6}}><span>{icon}</span><span>{txt}</span></div>;
+
+// ── LoginScreen ───────────────────────────────────────────────────────────────
+function LoginScreen({ onLogin, users }){
+  const [un,setUn]=useState(""); const [pw,setPw]=useState(""); const [err,setErr]=useState(""); const [show,setShow]=useState(false);
+  function login(){ const u=users.find(u=>u.username.toLowerCase()===un.trim().toLowerCase()&&u.password===pw); if(u){setErr("");onLogin(u);}else setErr("Invalid username or password."); }
+  return(
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#0f1c33 0%,#1a3a6e 60%,#0f4c81 100%)",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:FONT}}>
+      <div style={{background:"#fff",borderRadius:24,padding:"44px 40px",width:"100%",maxWidth:420,boxShadow:"0 24px 80px rgba(0,0,0,0.35)"}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <div style={{display:"flex",justifyContent:"center",marginBottom:14}}><SwamiBadge size={72}/></div>
+          <div style={{fontSize:20,fontWeight:900,color:"#0f1c33",lineHeight:1.3}}>CNG Shree Swami<br/>Petroleum</div>
+          <div style={{fontSize:12,color:"#f57f17",fontWeight:700,marginTop:4,letterSpacing:1}}>🙏 श्री स्वामी समर्थ 🙏</div>
+          <div style={{fontSize:11,color:"#5a6a85",fontWeight:600,marginTop:6}}>Management System</div>
+        </div>
+        <div style={{marginBottom:18}}><span style={lbl()}>Username</span><input value={un} onChange={e=>{setUn(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&login()} placeholder="Enter your username" style={inp()}/></div>
+        <div style={{marginBottom:22,position:"relative"}}>
+          <span style={lbl()}>Password</span>
+          <input type={show?"text":"password"} value={pw} onChange={e=>{setPw(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&login()} placeholder="Enter your password" style={inp({paddingRight:44})}/>
+          <button onClick={()=>setShow(p=>!p)} style={{position:"absolute",right:12,top:30,background:"none",border:"none",cursor:"pointer",color:"#5a6a85",fontSize:16,padding:0}}>{show?"🙈":"👁️"}</button>
+        </div>
+        {err&&<div style={{background:"#fce4e4",border:"1.5px solid #ef9a9a",borderRadius:9,padding:"10px 14px",fontSize:13,color:"#c62828",fontWeight:600,marginBottom:16}}>⚠️ {err}</div>}
+        <button onClick={login} style={{width:"100%",background:"linear-gradient(135deg,#0f4c81,#3b9edd)",color:"#fff",border:"none",borderRadius:12,padding:"14px",fontSize:15,fontWeight:800,cursor:"pointer",fontFamily:FONT}}>Sign In →</button>
+      </div>
+    </div>
+  );
+}
+
+// ── AuditPanel ────────────────────────────────────────────────────────────────
+function AuditPanel({ log, machineId, shift }){
+  const f=(log||[]).filter(l=>l.machineId===machineId&&l.shift===shift);
+  if(!f.length)return null;
+  return(
+    <div style={{background:"#fff8e1",border:"1.5px solid #ffe082",borderRadius:12,padding:"12px 16px",marginTop:12}}>
+      <div style={{fontSize:10,fontWeight:700,color:"#f57f17",letterSpacing:1.5,marginBottom:8}}>🔍 MODIFICATION HISTORY</div>
+      <div style={{maxHeight:120,overflowY:"auto"}}>
+        {[...f].reverse().map((e,i)=>(
+          <div key={i} style={{display:"flex",gap:10,marginBottom:5,padding:"5px 8px",background:i%2===0?"rgba(255,255,255,0.6)":"transparent",borderRadius:6}}>
+            <div style={{width:26,height:26,borderRadius:"50%",background:"linear-gradient(135deg,#0f4c81,#3b9edd)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:"#fff",fontWeight:800,flexShrink:0}}>{e.displayName?.[0]||"?"}</div>
+            <div><div style={{fontSize:12,fontWeight:700,color:"#1a2740"}}>{e.displayName} <span style={{color:"#5a6a85",fontWeight:500}}>({e.role})</span></div><div style={{fontSize:11,color:"#5a6a85"}}>{e.action} · {fmtDT(e.at)}</div></div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── BalanceMeter ──────────────────────────────────────────────────────────────
+function BalanceMeter({ entry, cngRate }){
+  const sale=calcEntrySale(entry),coll=calcEntryCollection(entry),short=calcEntryShortage(entry);
+  const rate=parseFloat(cngRate)||0,exp=+(sale*rate).toFixed(2),net=+(coll-short).toFixed(2),diff=+(net-exp).toFixed(2);
+  const has=coll>0||sale>0,ok=has&&Math.abs(diff)<0.01,over=diff>0.01;
+  const bg=!has?"#f7f9fc":ok?"linear-gradient(135deg,#e8f5e9,#f0fff4)":over?"linear-gradient(135deg,#fff8e1,#fffde7)":"linear-gradient(135deg,#fce4e4,#fff5f5)";
+  const bdr=!has?"#dde3ec":ok?"#a5d6a7":over?"#ffe082":"#ef9a9a";
+  const tc=!has?"#aab":ok?"#2e7d32":over?"#f57f17":"#c62828";
+  const st=!has?"No data":ok?"✓ Balanced":over?`+₹${Math.abs(diff).toFixed(2)} Excess`:`−₹${Math.abs(diff).toFixed(2)} Short`;
+  const pct=exp>0?Math.min(100,(net/exp)*100):0;
+  return(
+    <div style={{background:bg,borderRadius:12,border:`1.5px solid ${bdr}`,padding:"14px 16px",marginTop:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+        <div><div style={{fontSize:10,fontWeight:700,color:"#5a6a85",letterSpacing:1.2,marginBottom:3}}>BALANCE</div><div style={{fontSize:20,fontWeight:900,color:tc}}>{st}</div></div>
+        <div style={{textAlign:"right"}}><div style={{fontSize:10,color:"#5a6a85",fontWeight:700,marginBottom:2}}>EXPECTED @ ₹{rate}/Kg</div><div style={{fontSize:18,fontWeight:900,color:"#1a2740"}}>₹{exp.toFixed(2)}</div></div>
+      </div>
+      <div style={{background:"#dde3ec",borderRadius:99,height:6,overflow:"hidden"}}><div style={{width:`${pct}%`,height:"100%",borderRadius:99,background:ok?"#43a047":over?"#fb8c00":"#e53935",transition:"width 0.5s"}}/></div>
+      <div style={{display:"flex",gap:16,marginTop:10,flexWrap:"wrap"}}>
+        {[{l:"Sale",v:`${sale.toFixed(2)} Kg`},{l:"Expected",v:`₹${exp.toFixed(2)}`,c:"#1a3a6e"},{l:"Collected",v:`₹${coll.toFixed(2)}`},...(short>0?[{l:"Shortage",v:`−₹${short.toFixed(2)}`,c:"#c62828"}]:[]),{l:"Net",v:`₹${net.toFixed(2)}`,c:tc}].map(s=>(
+          <div key={s.l}><div style={{fontSize:9,color:"#5a6a85",fontWeight:700,letterSpacing:1}}>{s.l.toUpperCase()}</div><div style={{fontSize:13,fontWeight:800,color:s.c||"#1a2740"}}>{s.v}</div></div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── MeterGroup ────────────────────────────────────────────────────────────────
+function MeterGroup({ mKey, machineId, entry, onChange, suggested, isReadOnly, col }){
+  const meter=entry.meters[mKey],ms=calcMeterSale(meter);
+  const sugVal=parseFloat(suggested)||0,openVal=parseFloat(meter.opening)||0;
+  const hasSug=suggested!==null&&suggested!==undefined&&suggested!==""&&sugVal>0;
+  const dev=hasSug?+(openVal-sugVal).toFixed(2):0,hasDev=hasSug&&Math.abs(dev)>0.01;
+  return(
+    <div style={{background:"#f7f9fc",borderRadius:10,padding:"12px 14px",border:`1.5px solid ${hasDev?"#ffe082":"#dde3ec"}`}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <div style={{width:30,height:30,background:`linear-gradient(135deg,${col.bg},${col.accent})`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:14,color:"#fff"}}>{machineId}{mKey}</div>
+        <div style={{fontSize:11,fontWeight:700,color:"#5a6a85"}}>METER {machineId}{mKey}</div>
+        {hasSug&&<div style={{marginLeft:"auto",fontSize:9.5,color:"#5a6a85"}}>Suggested: <b style={{color:"#1a2740"}}>{suggested}</b></div>}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+        <div>
+          <span style={lbl()}>Opening</span>
+          <input type="number" min="0" value={meter.opening} onChange={e=>onChange({...entry,meters:{...entry.meters,[mKey]:{...meter,opening:e.target.value}}})} disabled={isReadOnly} style={inp({borderColor:hasDev?"#ffe082":"#dde3ec",background:hasDev?"#fffde7":"#f7f9fc"})}/>
+          {hasSug&&<button onClick={()=>onChange({...entry,meters:{...entry.meters,[mKey]:{...meter,opening:suggested}}})} style={{marginTop:4,fontSize:10,color:col.bg,fontWeight:700,background:col.light,border:`1px solid ${col.accent}55`,borderRadius:6,padding:"2px 8px",cursor:"pointer",fontFamily:FONT}}>Use {suggested}</button>}
+        </div>
+        <div><span style={lbl()}>Closing</span><input type="number" min="0" value={meter.closing} onChange={e=>onChange({...entry,meters:{...entry.meters,[mKey]:{...meter,closing:e.target.value}}})} disabled={isReadOnly} style={inp()}/></div>
+      </div>
+      {hasDev&&<div style={{background:"#fff8e1",border:"1.5px solid #ffe082",borderRadius:8,padding:"7px 10px",marginBottom:8,display:"flex",alignItems:"center",gap:8}}><span>⚠️</span><div style={{fontSize:11,fontWeight:700,color:"#e65100"}}>Opening differs from suggested by <span style={{color:dev>0?"#f57f17":"#c62828"}}>{dev>0?"+":""}{dev}</span></div></div>}
+      <div style={{background:ms>0?col.light:"#f0f0f0",border:`1.5px solid ${ms>0?col.accent+"55":"#dde3ec"}`,borderRadius:8,padding:"7px 10px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div><div style={{fontSize:9,color:"#5a6a85",fontWeight:700,letterSpacing:1}}>SALE</div><div style={{fontSize:18,fontWeight:900,color:ms>0?"#2e7d32":"#bbb"}}>{ms.toFixed(2)} <span style={{fontSize:11}}>Kg</span></div></div>
+        <span style={{fontSize:20}}>⛽</span>
+      </div>
+    </div>
+  );
+}
+
+// ── ShiftEntryCard ────────────────────────────────────────────────────────────
+function ShiftEntryCard({ entry, activeShift, onChange, onShiftChange, onSave, onReset, cngRate, auditLog, isHistoric, isReadOnly, prevClosing, source, isFresh }){
+  const col=MACHINE_COLORS[entry.machineId];
+  const sale=calcEntrySale(entry),coll=calcEntryCollection(entry);
+  const [confirmReset,setConfirmReset]=useState(false);
+  return(
+    <div style={{background:"#fff",borderRadius:16,boxShadow:"0 4px 20px rgba(0,0,0,0.08)",border:`2px solid ${col.accent}33`,overflow:"hidden",marginBottom:16}}>
+      <div style={{background:`linear-gradient(135deg,${col.bg},${col.accent})`,padding:"14px 20px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+          <div style={{width:46,height:46,background:"rgba(255,255,255,0.18)",borderRadius:12,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:900,color:"#fff",border:"2px solid rgba(255,255,255,0.3)",flexShrink:0}}>M{entry.machineId}</div>
+          <div style={{flex:1}}>
+            <div style={{color:"rgba(255,255,255,0.6)",fontSize:10,fontWeight:700,letterSpacing:1.5}}>MACHINE {entry.machineId} — {activeShift.toUpperCase()} SHIFT</div>
+            <div style={{color:"rgba(255,255,255,0.85)",fontSize:11,marginTop:2}}>Meters {entry.machineId}A & {entry.machineId}B</div>
+          </div>
+          <div style={{display:"flex",gap:16}}>
+            <div style={{textAlign:"right"}}><div style={{color:"rgba(255,255,255,0.6)",fontSize:9,fontWeight:700}}>SALE</div><div style={{color:"#fff",fontSize:20,fontWeight:900}}>{sale} Kg</div></div>
+            <div style={{textAlign:"right"}}><div style={{color:"rgba(255,255,255,0.6)",fontSize:9,fontWeight:700}}>COLLECTED</div><div style={{color:"#fff",fontSize:20,fontWeight:900}}>₹{coll}</div></div>
+          </div>
+        </div>
+        <div style={{background:"rgba(255,255,255,0.13)",borderRadius:10,padding:"10px 14px",border:"1.5px solid rgba(255,255,255,0.2)"}}>
+          <div style={{fontSize:9.5,fontWeight:700,color:"rgba(255,255,255,0.6)",letterSpacing:1.5,marginBottom:8}}>👤 EMPLOYEE ON DUTY</div>
+          <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:10}}>
+            <div><div style={{fontSize:9.5,color:"rgba(255,255,255,0.55)",fontWeight:700,marginBottom:4}}>FULL NAME</div><input value={entry.employeeName} onChange={e=>onChange({...entry,employeeName:e.target.value})} disabled={isReadOnly} placeholder="Employee name" style={{...inp(),background:"rgba(255,255,255,0.15)",border:"1.5px solid rgba(255,255,255,0.3)",color:"#fff",fontWeight:700}}/></div>
+            <div><div style={{fontSize:9.5,color:"rgba(255,255,255,0.55)",fontWeight:700,marginBottom:4}}>EMPLOYEE ID</div><input value={entry.employeeId} onChange={e=>onChange({...entry,employeeId:e.target.value})} disabled={isReadOnly} placeholder="EMP-001" style={{...inp(),background:"rgba(255,255,255,0.15)",border:"1.5px solid rgba(255,255,255,0.3)",color:"#fff"}}/></div>
+            <div><div style={{fontSize:9.5,color:"rgba(255,255,255,0.55)",fontWeight:700,marginBottom:4}}>SHIFT</div>
+              <select value={activeShift} onChange={e=>onShiftChange(e.target.value)} disabled={isReadOnly} style={{...inp(),background:"rgba(255,255,255,0.15)",border:"1.5px solid rgba(255,255,255,0.3)",color:"#fff"}}>
+                {SHIFTS.map(s=><option key={s} value={s} style={{color:"#1a2740"}}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{padding:"18px 20px 14px"}}>
+        {prevClosing&&isFresh&&(
+          <div style={{background:source==="prevDay"?"#f5eaf8":"#e8f4fd",border:`1.5px solid ${source==="prevDay"?"#ce93d8":"#90caf9"}`,borderRadius:10,padding:"10px 14px",marginBottom:14,display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:16}}>{source==="prevDay"?"📅":"📋"}</span>
+            <div>
+              <div style={{fontSize:11,fontWeight:700,color:source==="prevDay"?"#7b2d8b":"#0f4c81"}}>
+                {source==="prevDay"?"Previous day closing carried forward":"Previous shift closing carried forward"}
+                {prevClosing.shift&&source==="sameDay"&&<span style={{marginLeft:6,background:SHIFT_COLORS[prevClosing.shift]+"22",color:SHIFT_COLORS[prevClosing.shift],borderRadius:99,padding:"1px 8px",fontSize:10,fontWeight:700}}>{prevClosing.shift}</span>}
+              </div>
+              <div style={{fontSize:11,color:"#5a6a85",marginTop:2}}>Meter A: <b>{prevClosing.A||"—"}</b> · Meter B: <b>{prevClosing.B||"—"}</b> — Edit if different</div>
+            </div>
+          </div>
+        )}
+        <div style={{marginBottom:16}}>
+          {sHead("⛽","METER READINGS")}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            {["A","B"].map(k=><MeterGroup key={k} mKey={k} machineId={entry.machineId} entry={entry} onChange={onChange} suggested={prevClosing?prevClosing[k]:null} isReadOnly={isReadOnly} col={col}/>)}
+          </div>
+        </div>
+        <div style={{marginBottom:16}}>
+          {sHead("💳","PAYMENT COLLECTION")}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
+            {PAYMENT_METHODS.map(method=>{
+              const icons={Cash:"💵","PhonePay / GPay":"📱","Credit Card":"💳","Debit Card":"🏧",Petrocard:"⛽"};
+              const val=parseFloat(entry.payments[method])||0;
+              return(
+                <div key={method} style={{background:val>0?col.light:"#f7f9fc",borderRadius:9,padding:"9px 9px 7px",border:`1.5px solid ${val>0?col.accent+"55":"#dde3ec"}`}}>
+                  <div style={{fontSize:16,marginBottom:3}}>{icons[method]}</div>
+                  <div style={{fontSize:9,fontWeight:700,color:"#5a6a85",letterSpacing:0.6,marginBottom:5,lineHeight:1.3}}>{method.toUpperCase()}</div>
+                  <input type="number" min="0" value={entry.payments[method]} onChange={e=>onChange({...entry,payments:{...entry.payments,[method]:e.target.value}})} disabled={isReadOnly} placeholder="0" style={inp({padding:"5px 7px",fontSize:12,fontWeight:700,textAlign:"center"})}/>
+                  {val>0&&<div style={{fontSize:9.5,color:col.bg,fontWeight:700,marginTop:2,textAlign:"center"}}>₹{val.toLocaleString()}</div>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 2fr",gap:12,marginBottom:4}}>
+          <div><span style={lbl("#c62828")}>⚠️ Shortage (₹)</span><input type="number" min="0" value={entry.shortage} onChange={e=>onChange({...entry,shortage:e.target.value})} disabled={isReadOnly} placeholder="0" style={inp({borderColor:parseFloat(entry.shortage)>0?"#ef9a9a":"#dde3ec",background:parseFloat(entry.shortage)>0?"#fff5f5":"#f7f9fc"})}/></div>
+          <div><span style={lbl()}>Notes</span><input value={entry.notes} onChange={e=>onChange({...entry,notes:e.target.value})} disabled={isReadOnly} placeholder="Any remarks..." style={inp()}/></div>
+        </div>
+        <BalanceMeter entry={entry} cngRate={cngRate}/>
+        <AuditPanel log={auditLog} machineId={entry.machineId} shift={activeShift}/>
+        {!isReadOnly&&(
+          <div style={{marginTop:14,paddingTop:14,borderTop:`1.5px solid ${col.accent}22`}}>
+            {confirmReset?(
+              <div style={{background:"#fce4e4",border:"1.5px solid #ef9a9a",borderRadius:10,padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
+                <span style={{fontSize:12.5,fontWeight:700,color:"#c62828"}}>Reset & delete M{entry.machineId} {activeShift}?</span>
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={()=>setConfirmReset(false)} style={{background:"#fff",border:"1.5px solid #dde3ec",color:"#5a6a85",borderRadius:7,padding:"6px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:FONT}}>Cancel</button>
+                  <button onClick={()=>{setConfirmReset(false);onReset&&onReset();}} style={{background:"#c62828",border:"none",color:"#fff",borderRadius:7,padding:"6px 14px",fontSize:12,fontWeight:800,cursor:"pointer",fontFamily:FONT}}>Yes, Reset</button>
+                </div>
+              </div>
+            ):(
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <button onClick={()=>setConfirmReset(true)} style={{background:"#fce4e4",border:"1.5px solid #ef9a9a",color:"#c62828",borderRadius:9,padding:"9px 18px",fontSize:12.5,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>🔄 Reset</button>
+                {onSave&&<button onClick={onSave} style={{background:`linear-gradient(135deg,${col.bg},${col.accent})`,border:"none",color:"#fff",borderRadius:9,padding:"10px 24px",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:FONT}}>💾 Save</button>}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── DayOverview ───────────────────────────────────────────────────────────────
+function DayOverview({ entries, date, cngRate }){
+  const rate=parseFloat(cngRate)||0;
+  const ts=entries.reduce((s,e)=>s+calcEntrySale(e),0),tc=entries.reduce((s,e)=>s+calcEntryCollection(e),0),tsh=entries.reduce((s,e)=>s+calcEntryShortage(e),0);
+  const te=+(ts*rate).toFixed(2),tn=+(tc-tsh).toFixed(2),diff=+(tn-te).toFixed(2);
+  const ok=ts>0&&Math.abs(diff)<0.01,over=diff>0.01;
+  const bc=ok?"#43a047":over?"#fb8c00":"#e53935",bt=ok?"✓ Balanced":over?`+₹${Math.abs(diff).toFixed(2)} Excess`:`−₹${Math.abs(diff).toFixed(2)} Short`;
+  const pct=te>0?Math.min(100,(tn/te)*100):0;
+  const mw=Object.fromEntries(PAYMENT_METHODS.map(m=>[m,entries.reduce((s,e)=>s+(parseFloat(e.payments[m])||0),0)]));
+  const mt=MACHINES.map(id=>{ const me=entries.filter(e=>e.machineId===id); return{id,sale:me.reduce((s,e)=>s+calcEntrySale(e),0),col:me.reduce((s,e)=>s+calcEntryCollection(e),0),short:me.reduce((s,e)=>s+calcEntryShortage(e),0)}; });
+  if(!entries.length) return <div style={{background:"#fff",borderRadius:16,padding:"48px",textAlign:"center",boxShadow:"0 2px 12px rgba(0,0,0,0.07)"}}><div style={{fontSize:48,marginBottom:12}}>📭</div><div style={{fontSize:16,fontWeight:700,color:"#5a6a85"}}>No entries saved for {fmtDate(date)}</div></div>;
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <div style={{background:"linear-gradient(135deg,#0f1c33,#1a3a6e)",borderRadius:20,padding:"24px 28px",color:"#fff",position:"relative",overflow:"hidden"}}>
+        <div style={{position:"absolute",top:-40,right:-40,width:180,height:180,borderRadius:"50%",background:"rgba(255,255,255,0.04)"}}/>
+        <div style={{position:"relative"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+            <div><div style={{fontSize:11,color:"rgba(255,255,255,0.45)",fontWeight:700,letterSpacing:2,marginBottom:6}}>DAILY OVERVIEW</div><div style={{fontSize:20,fontWeight:900}}>{new Date(date+"T00:00:00").toLocaleDateString("en-IN",{weekday:"long",day:"numeric",month:"long",year:"numeric"})}</div><div style={{fontSize:12,color:"rgba(255,255,255,0.5)",marginTop:4}}>CNG Rate: ₹{rate}/Kg</div></div>
+            <div style={{textAlign:"right"}}><div style={{fontSize:10,color:"rgba(255,255,255,0.45)",fontWeight:700,letterSpacing:1.5,marginBottom:4}}>TOTAL SALE</div><div style={{fontSize:34,fontWeight:900,color:"#7ee8a2",lineHeight:1}}>{ts.toFixed(2)}<span style={{fontSize:15,marginLeft:6}}>Kg</span></div></div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:18}}>
+            {[{icon:"💰",l:"Collection",v:`₹${tc.toFixed(2)}`,c:"#7ee8a2"},{icon:"🎯",l:"Expected",v:`₹${te.toFixed(2)}`,c:"#90caf9"},{icon:"⚠️",l:"Shortage",v:tsh>0?`₹${tsh.toFixed(2)}`:"None",c:tsh>0?"#ff8a80":"rgba(255,255,255,0.4)"},{icon:"📊",l:"Balance",v:bt,c:ok?"#7ee8a2":over?"#ffe082":"#ff8a80"}].map(s=>(
+              <div key={s.l} style={{background:"rgba(255,255,255,0.07)",borderRadius:12,padding:"12px 14px",border:"1px solid rgba(255,255,255,0.08)"}}><div style={{fontSize:16,marginBottom:5}}>{s.icon}</div><div style={{fontSize:9,color:"rgba(255,255,255,0.4)",fontWeight:700,letterSpacing:1,marginBottom:3}}>{s.l.toUpperCase()}</div><div style={{fontSize:15,fontWeight:900,color:s.c}}>{s.v}</div></div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+            {mt.map(m=>{ const col=MACHINE_COLORS[m.id],exp=+(m.sale*rate).toFixed(2),net=+(m.col-m.short).toFixed(2),d=+(net-exp).toFixed(2),mok=m.sale>0&&Math.abs(d)<0.01,mov=d>0.01; return(<div key={m.id} style={{background:"rgba(255,255,255,0.06)",borderRadius:12,padding:"12px 16px",border:`1px solid ${col.accent}44`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:32,height:32,background:`linear-gradient(135deg,${col.bg},${col.accent})`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:14,color:"#fff"}}>M{m.id}</div><div style={{color:"rgba(255,255,255,0.7)",fontWeight:700,fontSize:13}}>Machine {m.id}</div></div><div style={{fontSize:13,fontWeight:900,color:mok?"#7ee8a2":mov?"#ffe082":"#ff8a80"}}>{mok?"✓":mov?`+₹${Math.abs(d).toFixed(0)}`:`−₹${Math.abs(d).toFixed(0)}`}</div></div><div style={{display:"flex",gap:14,flexWrap:"wrap"}}>{[{l:"Sale",v:`${m.sale.toFixed(2)} Kg`},{l:"Expected",v:`₹${exp.toFixed(2)}`},{l:"Collected",v:`₹${m.col.toFixed(2)}`},...(m.short>0?[{l:"Shortage",v:`₹${m.short.toFixed(2)}`}]:[])].map(s=>(<div key={s.l}><div style={{fontSize:8.5,color:"rgba(255,255,255,0.4)",fontWeight:700}}>{s.l.toUpperCase()}</div><div style={{fontSize:12,fontWeight:800,color:"rgba(255,255,255,0.85)"}}>{s.v}</div></div>))}</div></div>); })}
+          </div>
+          <div style={{background:"rgba(255,255,255,0.05)",borderRadius:12,padding:"12px 16px",border:"1px solid rgba(255,255,255,0.07)"}}>
+            <div style={{fontSize:9,color:"rgba(255,255,255,0.35)",fontWeight:700,letterSpacing:1.5,marginBottom:10}}>PAYMENT BREAKDOWN</div>
+            <div style={{display:"flex",flexWrap:"wrap"}}>
+              {PAYMENT_METHODS.map((m,i)=>(<div key={m} style={{flex:"1 1 0",minWidth:70,padding:"0 10px",borderLeft:i>0?"1px solid rgba(255,255,255,0.08)":"none"}}><div style={{fontSize:8.5,color:"rgba(255,255,255,0.35)",fontWeight:700,marginBottom:3}}>{m.toUpperCase()}</div><div style={{fontSize:14,fontWeight:800,color:"#fff"}}>₹{mw[m].toFixed(0)}</div></div>))}
+              <div style={{flex:"1 1 0",minWidth:90,padding:"0 0 0 10px",borderLeft:"1px solid rgba(255,255,255,0.08)"}}><div style={{fontSize:8.5,color:"rgba(255,255,255,0.35)",fontWeight:700,marginBottom:3}}>GRAND TOTAL</div><div style={{fontSize:18,fontWeight:900,color:"#7ee8a2"}}>₹{tc.toFixed(2)}</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{background:ok?"linear-gradient(135deg,#e8f5e9,#f0fff4)":over?"linear-gradient(135deg,#fff8e1,#fffde7)":"linear-gradient(135deg,#fce4e4,#fff5f5)",borderRadius:16,padding:"18px 24px",border:`2px solid ${ok?"#a5d6a7":over?"#ffe082":"#ef9a9a"}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div><div style={{fontSize:10,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:4}}>OVERALL BALANCE</div><div style={{fontSize:26,fontWeight:900,color:ok?"#2e7d32":over?"#f57f17":"#c62828"}}>{bt}</div></div>
+          <div style={{textAlign:"right"}}><div style={{fontSize:10,color:"#5a6a85",fontWeight:700,marginBottom:2}}>COLLECTION RATE</div><div style={{fontSize:28,fontWeight:900,color:"#1a2740"}}>{pct.toFixed(1)}<span style={{fontSize:14}}>%</span></div></div>
+        </div>
+        <div style={{background:"#dde3ec",borderRadius:99,height:8,overflow:"hidden",marginBottom:12}}><div style={{width:`${pct}%`,height:"100%",borderRadius:99,background:bc,transition:"width 0.6s"}}/></div>
+        <div style={{display:"flex",flexWrap:"wrap"}}>
+          {[{l:"Total Sale",v:`${ts.toFixed(2)} Kg`},{l:`Expected @ ₹${rate}/Kg`,v:`₹${te.toFixed(2)}`,c:"#1a3a6e"},{l:"Total Collected",v:`₹${tc.toFixed(2)}`},...(tsh>0?[{l:"Shortage",v:`−₹${tsh.toFixed(2)}`,c:"#c62828"}]:[]),{l:"Net",v:`₹${tn.toFixed(2)}`,c:ok?"#2e7d32":over?"#f57f17":"#c62828"}].map((s,i)=>(
+            <div key={s.l} style={{flex:"1 1 0",minWidth:90,padding:"0 14px",borderLeft:i>0?"1.5px solid #dde3ec":"none"}}><div style={{fontSize:9,color:"#5a6a85",fontWeight:700,letterSpacing:1,marginBottom:3}}>{s.l.toUpperCase()}</div><div style={{fontSize:15,fontWeight:900,color:s.c||"#1a2740"}}>{s.v}</div></div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── UserManager ───────────────────────────────────────────────────────────────
+function UserManager({ users, setUsers, currentUser }){
+  const [showAdd,setShowAdd]=useState(false);
+  const [form,setForm]=useState({username:"",password:"",role:"operator",displayName:""});
+  const [err,setErr]=useState("");
+  function addUser(){ if(!form.username||!form.password||!form.displayName){setErr("All fields required.");return;} if(users.find(u=>u.username===form.username)){setErr("Username exists.");return;} setUsers([...users,{...form}]);setForm({username:"",password:"",role:"operator",displayName:""});setShowAdd(false);setErr(""); }
+  function removeUser(un){ if(un===currentUser.username){alert("Cannot remove yourself.");return;} if(un==="admin"){alert("Cannot remove admin.");return;} setUsers(users.filter(u=>u.username!==un)); }
+  const rc={admin:"#0f4c81",manager:"#7b2d8b",operator:"#1a6644"};
+  return(
+    <div style={{background:"#fff",borderRadius:16,padding:"22px",boxShadow:"0 2px 12px rgba(0,0,0,0.07)"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5}}>👥 USER MANAGEMENT</div>
+        <button onClick={()=>setShowAdd(p=>!p)} style={{background:"linear-gradient(135deg,#0f4c81,#3b9edd)",color:"#fff",border:"none",borderRadius:9,padding:"8px 18px",fontSize:12.5,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>{showAdd?"Cancel":"+ Add User"}</button>
+      </div>
+      {showAdd&&<div style={{background:"#f7f9fc",borderRadius:12,padding:"16px",marginBottom:20,border:"1.5px solid #dde3ec"}}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10,marginBottom:10}}><div><span style={lbl()}>Display Name</span><input value={form.displayName} onChange={e=>setForm(f=>({...f,displayName:e.target.value}))} style={inp()}/></div><div><span style={lbl()}>Username</span><input value={form.username} onChange={e=>setForm(f=>({...f,username:e.target.value}))} style={inp()}/></div><div><span style={lbl()}>Password</span><input value={form.password} onChange={e=>setForm(f=>({...f,password:e.target.value}))} style={inp()}/></div><div><span style={lbl()}>Role</span><select value={form.role} onChange={e=>setForm(f=>({...f,role:e.target.value}))} style={inp()}><option value="operator">Operator</option><option value="manager">Manager</option><option value="admin">Admin</option></select></div></div>{err&&<div style={{color:"#c62828",fontSize:12,fontWeight:600,marginBottom:8}}>⚠️ {err}</div>}<button onClick={addUser} style={{background:"#2e7d32",color:"#fff",border:"none",borderRadius:8,padding:"8px 20px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>Create User</button></div>}
+      <table style={{width:"100%",borderCollapse:"collapse"}}>
+        <thead><tr style={{background:"#eef2f7"}}>{["User","Username","Role","Actions"].map(h=><th key={h} style={{padding:"10px 14px",fontSize:10,fontWeight:700,color:"#5a6a85",letterSpacing:1.2,textAlign:"left"}}>{h}</th>)}</tr></thead>
+        <tbody>{users.map((u,i)=>(<tr key={u.username} style={{background:i%2===0?"#fff":"#fafbfc",borderBottom:"1px solid #f0f4f8"}}><td style={{padding:"12px 14px"}}><div style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:34,height:34,borderRadius:"50%",background:`linear-gradient(135deg,${rc[u.role]||"#5a6a85"},${rc[u.role]||"#5a6a85"}99)`,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:800,fontSize:13}}>{u.displayName?.[0]}</div><div style={{fontWeight:700,fontSize:13,color:"#1a2740"}}>{u.displayName}</div></div></td><td style={{padding:"12px 14px",color:"#5a6a85",fontSize:13}}>{u.username}</td><td style={{padding:"12px 14px"}}><span style={{background:rc[u.role]+"22",color:rc[u.role],borderRadius:99,padding:"3px 12px",fontSize:11,fontWeight:700}}>{u.role.toUpperCase()}</span></td><td style={{padding:"12px 14px"}}>{u.username!==currentUser.username&&<button onClick={()=>removeUser(u.username)} style={{background:"#fce4e4",color:"#c62828",border:"none",borderRadius:7,padding:"5px 12px",fontSize:11.5,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>Remove</button>}</td></tr>))}</tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── ChangeCredentials ─────────────────────────────────────────────────────────
+function ChangeCredentials({ currentUser, users, setUsers, setCurrentUser, showToast }){
+  const [step,setStep]=useState("verify");
+  const [cp,setCp]=useState("");const [nu,setNu]=useState("");const [np,setNp]=useState("");const [cf,setCf]=useState("");
+  const [sc,setSc]=useState(false);const [sn,setSn]=useState(false);const [scf,setScf]=useState(false);
+  const [err,setErr]=useState("");const [succ,setSucc]=useState("");
+  function verify(){ if(cp!==currentUser.password){setErr("Incorrect password.");return;} setErr("");setNu(currentUser.username);setStep("change"); }
+  function save(){
+    if(!nu.trim()){setErr("Username empty.");return;} if(np.length<6){setErr("Min 6 chars.");return;} if(np!==cf){setErr("Passwords don't match.");return;}
+    if(users.find(u=>u.username===nu.trim()&&u.username!==currentUser.username)){setErr("Username taken.");return;}
+    const upd=users.map(u=>u.username===currentUser.username?{...u,username:nu.trim(),password:np}:u);
+    setUsers(upd);setCurrentUser(prev=>({...prev,username:nu.trim(),password:np}));
+    setErr("");setSucc("Credentials updated!");showToast("✓ Credentials updated","#2e7d32");
+    setCp("");setNp("");setCf("");setStep("verify");setTimeout(()=>setSucc(""),4000);
+  }
+  const str=np.length<1?-1:np.length<6?0:np.length<8?1:/[A-Z]/.test(np)&&/[0-9]/.test(np)&&/[^a-zA-Z0-9]/.test(np)?3:2;
+  const sl=["Too short","Weak","Good","Strong"],sc2=["#e53935","#fb8c00","#43a047","#1a6644"];
+  const pwField=(val,set,show,tog,ph,extra={})=>(
+    <div style={{position:"relative"}}><input type={show?"text":"password"} value={val} onChange={e=>{set(e.target.value);setErr("");}} placeholder={ph} style={{...inp({paddingRight:44}),...extra}}/><button onClick={tog} style={{position:"absolute",right:12,top:10,background:"none",border:"none",cursor:"pointer",color:"#5a6a85",fontSize:16,padding:0}}>{show?"🙈":"👁️"}</button></div>
+  );
+  return(
+    <div style={{maxWidth:520}}>
+      <div style={{background:"#fff",borderRadius:20,boxShadow:"0 4px 20px rgba(0,0,0,0.08)",overflow:"hidden"}}>
+        <div style={{background:"linear-gradient(135deg,#0f1c33,#1a3a6e)",padding:"24px 28px"}}><div style={{fontSize:28,marginBottom:8}}>🔐</div><div style={{color:"#fff",fontSize:18,fontWeight:900}}>Change Credentials</div><div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginTop:4}}>Admin · {currentUser.displayName}</div></div>
+        <div style={{display:"flex",borderBottom:"1.5px solid #eef2f7"}}>{[{n:1,k:"verify",l:"Verify Identity"},{n:2,k:"change",l:"Set New Credentials"}].map(s=>{ const done=step==="change"&&s.k==="verify",active=step===s.k; return(<div key={s.k} style={{flex:1,padding:"14px",textAlign:"center",background:active?"#f0f6ff":done?"#f0fff4":"#fff",borderBottom:active?"3px solid #3b9edd":done?"3px solid #43a047":"3px solid transparent"}}><div style={{width:26,height:26,borderRadius:"50%",background:active?"#3b9edd":done?"#43a047":"#dde3ec",color:"#fff",fontWeight:900,fontSize:13,display:"inline-flex",alignItems:"center",justifyContent:"center",marginBottom:5}}>{done?"✓":s.n}</div><div style={{fontSize:11,fontWeight:700,color:active?"#1a3a6e":done?"#2e7d32":"#5a6a85"}}>{s.l}</div></div>); })}</div>
+        <div style={{padding:"28px"}}>
+          {succ&&<div style={{background:"#e8f5e9",border:"1.5px solid #a5d6a7",borderRadius:10,padding:"12px 16px",fontSize:13,fontWeight:700,color:"#2e7d32",marginBottom:20}}>✓ {succ}</div>}
+          {err&&<div style={{background:"#fce4e4",border:"1.5px solid #ef9a9a",borderRadius:10,padding:"12px 16px",fontSize:13,fontWeight:600,color:"#c62828",marginBottom:20}}>⚠️ {err}</div>}
+          {step==="verify"&&(<><div style={{background:"#fff8e1",border:"1.5px solid #ffe082",borderRadius:10,padding:"12px 16px",fontSize:13,color:"#e65100",fontWeight:600,marginBottom:22}}>🛡️ Enter current password to verify identity.</div><div style={{marginBottom:22}}><span style={lbl()}>Current Password</span>{pwField(cp,setCp,sc,()=>setSc(p=>!p),"Current password")}</div><button onClick={verify} style={{width:"100%",background:"linear-gradient(135deg,#0f4c81,#3b9edd)",color:"#fff",border:"none",borderRadius:12,padding:"13px",fontSize:15,fontWeight:800,cursor:"pointer",fontFamily:FONT}}>Verify Identity →</button></>)}
+          {step==="change"&&(<><div style={{background:"#e8f4fd",border:"1.5px solid #90caf9",borderRadius:10,padding:"12px 16px",fontSize:13,color:"#0f4c81",fontWeight:600,marginBottom:22}}>✓ Identity verified. Update your credentials below.</div><div style={{marginBottom:18}}><span style={lbl()}>New Username</span><input value={nu} onChange={e=>{setNu(e.target.value);setErr("");}} style={inp()}/></div><div style={{marginBottom:18}}><span style={lbl()}>New Password</span>{pwField(np,setNp,sn,()=>setSn(p=>!p),"Min. 6 characters")}{str>=0&&<div style={{marginTop:8}}><div style={{display:"flex",gap:4,marginBottom:4}}>{[0,1,2,3].map(i=><div key={i} style={{flex:1,height:4,borderRadius:99,background:i<=str?sc2[str]:"#dde3ec"}}/>)}</div><div style={{fontSize:11,fontWeight:700,color:sc2[str]}}>{sl[str]}</div></div>}</div><div style={{marginBottom:24}}><span style={lbl()}>Confirm Password</span>{pwField(cf,setCf,scf,()=>setScf(p=>!p),"Re-enter password",{borderColor:cf&&cf!==np?"#ef9a9a":cf&&cf===np?"#a5d6a7":"#dde3ec"})}{cf&&cf===np&&<div style={{fontSize:11,fontWeight:700,color:"#2e7d32",marginTop:6}}>✓ Passwords match</div>}</div><div style={{display:"flex",gap:10}}><button onClick={()=>{setStep("verify");setErr("");setNp("");setCf("");}} style={{flex:1,background:"#f0f4f8",color:"#5a6a85",border:"1.5px solid #dde3ec",borderRadius:12,padding:"12px",fontSize:14,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>← Back</button><button onClick={save} style={{flex:2,background:"linear-gradient(135deg,#1a6644,#34c678)",color:"#fff",border:"none",borderRadius:12,padding:"12px",fontSize:14,fontWeight:800,cursor:"pointer",fontFamily:FONT}}>💾 Save</button></div></>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── ReportsView ───────────────────────────────────────────────────────────────
+function ReportsView({ allRecords, stationTitle }){
+  const [rtype,setRtype]=useState("daily");
+  const [selDate,setSelDate]=useState(todayStr());
+  const [cFrom,setCFrom]=useState(todayStr());
+  const [cTo,setCTo]=useState(todayStr());
+  const [selShifts,setSelShifts]=useState([...SHIFTS]);
+  const [selMachines,setSelMachines]=useState([...MACHINES]);
+  const [showFilters,setShowFilters]=useState(false);
+  const [pdfLoading,setPdfLoading]=useState(false);
+  const togShift=s=>setSelShifts(p=>p.includes(s)?p.filter(x=>x!==s):[...p,s]);
+  const togMachine=m=>setSelMachines(p=>p.includes(m)?p.filter(x=>x!==m):[...p,m]);
+  const wk=useMemo(()=>{ const d=new Date(),day=d.getDay(),mon=new Date(d); mon.setDate(d.getDate()-(day===0?6:day-1)); const sun=new Date(mon); sun.setDate(mon.getDate()+6); return{from:mon.toISOString().split("T")[0],to:sun.toISOString().split("T")[0]}; },[]);
+  const mo=useMemo(()=>{ const d=new Date(); return{from:new Date(d.getFullYear(),d.getMonth(),1).toISOString().split("T")[0],to:new Date(d.getFullYear(),d.getMonth()+1,0).toISOString().split("T")[0]}; },[]);
+  const range=rtype==="daily"?{from:selDate,to:selDate}:rtype==="weekly"?wk:rtype==="monthly"?mo:{from:cFrom,to:cTo};
+  const filtered=useMemo(()=>allRecords.filter(r=>r.date>=range.from&&r.date<=range.to).sort((a,b)=>a.date.localeCompare(b.date)),[allRecords,range.from,range.to]);
+  const allE=filtered.flatMap(r=>(r.entries||[]).map(e=>({...e,date:r.date,cngRate:r.cngRate||DEFAULT_CNG_RATE}))).filter(e=>selMachines.includes(e.machineId)&&selShifts.includes(e.shift));
+  const gSale=allE.reduce((s,e)=>s+calcEntrySale(e),0),gCol=allE.reduce((s,e)=>s+calcEntryCollection(e),0),gShort=allE.reduce((s,e)=>s+calcEntryShortage(e),0);
+  const gExp=allE.reduce((s,e)=>s+calcEntrySale(e)*(parseFloat(e.cngRate)||0),0),gNet=+(gCol-gShort).toFixed(2),gDiff=+(gNet-gExp).toFixed(2);
+  const mw=Object.fromEntries(PAYMENT_METHODS.map(m=>[m,allE.reduce((s,e)=>s+(parseFloat(e.payments[m])||0),0)]));
+  const ms=MACHINES.filter(id=>selMachines.includes(id)).map(id=>{ const me=allE.filter(e=>e.machineId===id),sale=me.reduce((s,e)=>s+calcEntrySale(e),0),col=me.reduce((s,e)=>s+calcEntryCollection(e),0),short=me.reduce((s,e)=>s+calcEntryShortage(e),0),exp=me.reduce((s,e)=>s+calcEntrySale(e)*(parseFloat(e.cngRate)||0),0); return{id,sale,col,short,exp,net:+(col-short).toFixed(2)}; });
+  const ss=SHIFTS.filter(s=>selShifts.includes(s)).map(shift=>{ const se=allE.filter(e=>e.shift===shift),sale=se.reduce((s,e)=>s+calcEntrySale(e),0),col=se.reduce((s,e)=>s+calcEntryCollection(e),0),short=se.reduce((s,e)=>s+calcEntryShortage(e),0),exp=se.reduce((s,e)=>s+calcEntrySale(e)*(parseFloat(e.cngRate)||0),0); return{shift,sale,col,short,exp,net:+(col-short).toFixed(2),cnt:se.length}; }).filter(s=>s.cnt>0);
+  const mx=MACHINES.filter(id=>selMachines.includes(id)).flatMap(id=>SHIFTS.filter(s=>selShifts.includes(s)).map(shift=>{ const me=allE.filter(e=>e.machineId===id&&e.shift===shift); if(!me.length)return null; const sale=me.reduce((s,e)=>s+calcEntrySale(e),0),col=me.reduce((s,e)=>s+calcEntryCollection(e),0),short=me.reduce((s,e)=>s+calcEntryShortage(e),0),exp=me.reduce((s,e)=>s+calcEntrySale(e)*(parseFloat(e.cngRate)||0),0),emps=[...new Set(me.map(e=>e.employeeName).filter(Boolean))].join(", ")||"—"; return{machineId:id,shift,sale,col,short,exp,net:+(col-short).toFixed(2),emps}; })).filter(Boolean);
+  const audit=filtered.flatMap(r=>(r.auditLog||[]).map(e=>({...e,date:r.date}))).sort((a,b)=>(b.at||"").localeCompare(a.at||""));
+  const bCol=(n,e)=>{ const d=+(n-e).toFixed(2); return Math.abs(d)<0.01?"#2e7d32":d>0?"#f57f17":"#c62828"; };
+  const bLbl=(n,e)=>{ const d=+(n-e).toFixed(2); return Math.abs(d)<0.01?"Balanced":d>0?`+Rs.${Math.abs(d).toFixed(2)}`:"-Rs."+Math.abs(d).toFixed(2); };
+
+  function buildAndDownload(){
+    setPdfLoading(true);
+    try{
+      const rLabel=rtype==="daily"?`Daily - ${fmtDate(selDate)}`:rtype==="weekly"?`Weekly - ${fmtDate(range.from)} to ${fmtDate(range.to)}`:rtype==="monthly"?`Monthly - ${new Date(range.from+"T00:00:00").toLocaleDateString("en-IN",{month:"long",year:"numeric"})}`:`Custom - ${fmtDate(cFrom)} to ${fmtDate(cTo)}`;
+      const mRows=ms.map(o=>`<tr><td><b>Machine ${o.id}</b></td><td class=r>${o.sale.toFixed(2)} Kg</td><td class=r>Rs.${o.exp.toFixed(2)}</td><td class=r style="color:#1a6644">Rs.${o.col.toFixed(2)}</td><td class=r style="color:#c62828">${o.short>0?"Rs."+o.short.toFixed(2):"-"}</td><td class=r style="color:${bCol(o.net,o.exp)};font-weight:800">${bLbl(o.net,o.exp)}</td></tr>`).join("");
+      const sRows=ss.map((s,i)=>`<tr style="background:${i%2===0?"#fff":"#f8fafc"}"><td><b>${s.shift}</b></td><td class=r>${s.sale.toFixed(2)} Kg</td><td class=r>Rs.${s.exp.toFixed(2)}</td><td class=r style="color:#1a6644">Rs.${s.col.toFixed(2)}</td><td class=r style="color:#c62828">${s.short>0?"Rs."+s.short.toFixed(2):"-"}</td><td class=r style="color:${bCol(s.net,s.exp)};font-weight:800">${bLbl(s.net,s.exp)}</td></tr>`).join("");
+      const xRows=mx.map((r,i)=>`<tr style="background:${i%2===0?"#fff":"#f8fafc"}"><td>M${r.machineId}</td><td>${r.shift}</td><td>${r.emps}</td><td class=r>${r.sale.toFixed(2)} Kg</td><td class=r>Rs.${r.exp.toFixed(2)}</td><td class=r style="color:#1a6644">Rs.${r.col.toFixed(2)}</td><td class=r style="color:#c62828">${r.short>0?"Rs."+r.short.toFixed(2):"-"}</td><td class=r style="color:${bCol(r.net,r.exp)};font-weight:800">${bLbl(r.net,r.exp)}</td></tr>`).join("");
+      const pRows=PAYMENT_METHODS.map((m,i)=>`<tr style="background:${i%2===0?"#fff":"#f8fafc"}"><td>${m}</td><td class=r style="color:#1a6644;font-weight:700">Rs.${mw[m].toFixed(2)}</td><td class=r>${gCol>0?((mw[m]/gCol)*100).toFixed(1)+"%":"-"}</td></tr>`).join("");
+      const dRows=filtered.length>1?filtered.map((r,i)=>{ const e=r.entries||[],s=e.reduce((s,e)=>s+calcEntrySale(e),0),c=e.reduce((s,e)=>s+calcEntryCollection(e),0),sh=e.reduce((s,e)=>s+calcEntryShortage(e),0),rt=parseFloat(r.cngRate)||0,ex=+(s*rt).toFixed(2),nt=+(c-sh).toFixed(2); return`<tr style="background:${i%2===0?"#fff":"#f8fafc"}"><td>${fmtDate(r.date)}</td><td class=r>${s.toFixed(2)} Kg</td><td class=r>Rs.${rt}/Kg</td><td class=r>Rs.${ex.toFixed(2)}</td><td class=r style="color:#1a6644">Rs.${c.toFixed(2)}</td><td class=r style="color:#c62828">${sh>0?"Rs."+sh.toFixed(2):"-"}</td><td class=r style="color:${bCol(nt,ex)};font-weight:800">${bLbl(nt,ex)}</td></tr>`; }).join(""):"";
+      const aRows=audit.slice(0,100).map((e,i)=>`<tr style="background:${i%2===0?"#fff":"#fffdf5"}"><td>${fmtDate(e.date)}</td><td><b>${e.displayName||"-"}</b></td><td>${(e.role||"").toUpperCase()}</td><td style="color:#5a6a85">${e.action||"-"}</td><td style="font-size:11px">${fmtDT(e.at)}</td></tr>`).join("");
+      const css=`*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;font-size:12px;color:#1a2740;padding:16px}.wrap{max-width:960px;margin:0 auto}.hdr{background:#0f1c33;color:#fff;border-radius:8px;padding:18px 22px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}.big{font-size:22px;font-weight:900;color:#7ee8a2}.sub{color:rgba(255,255,255,0.5);font-size:11px}.card{background:#fff;border-radius:8px;margin-bottom:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.08)}.ch{background:#eef2f7;padding:7px 12px;font-size:9px;font-weight:700;color:#5a6a85;letter-spacing:1.5px;text-transform:uppercase}.cy{background:#fff8e1;padding:7px 12px;font-size:9px;font-weight:700;color:#f57f17;letter-spacing:1.5px;text-transform:uppercase}table{width:100%;border-collapse:collapse}th{background:#eef2f7;padding:6px 10px;font-size:9px;font-weight:700;color:#5a6a85;text-align:left}td{padding:6px 10px;border-bottom:1px solid #f0f4f8}tfoot td{background:#e8f0f8;font-weight:800}.r{text-align:right}.ft{text-align:center;padding:12px;font-size:10px;color:#aaa}@media print{body{padding:0}.hdr{border-radius:0}@page{margin:8mm;size:A4}}`;
+      const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CNG Report - ${rLabel}</title><style>${css}</style></head><body><div class=wrap><div class=hdr><div><div class=sub>CNG SHREE SWAMI PETROLEUM</div><h1 style="font-size:17px;margin:4px 0">${stationTitle}</h1><div class=sub>${rLabel} &bull; ${new Date().toLocaleString("en-IN")}</div></div><div style="text-align:right"><div class=sub>TOTAL SALE</div><div class=big>${gSale.toFixed(2)} Kg</div><div style="color:rgba(255,255,255,0.65);font-size:12px;margin-top:3px">Collection: <b style="color:#fff;font-size:15px">Rs.${gCol.toFixed(2)}</b></div>${gShort>0?`<div style="color:#ff8a80;font-size:11px">Shortage: Rs.${gShort.toFixed(2)}</div>`:""}</div></div><div class=card><div class=ch>Machine-wise Summary</div><table><thead><tr><th>Machine</th><th class=r>Sale (Kg)</th><th class=r>Expected</th><th class=r>Collection</th><th class=r>Shortage</th><th class=r>Balance</th></tr></thead><tbody>${mRows}</tbody><tfoot><tr><td><b>TOTAL</b></td><td class=r>${gSale.toFixed(2)} Kg</td><td class=r>Rs.${gExp.toFixed(2)}</td><td class=r style="color:#1a6644">Rs.${gCol.toFixed(2)}</td><td class=r style="color:#c62828">${gShort>0?"Rs."+gShort.toFixed(2):"-"}</td><td class=r style="color:${bCol(gNet,gExp)};font-weight:800">${bLbl(gNet,gExp)}</td></tr></tfoot></table></div>${ss.length>0?`<div class=card><div class=ch>Shift-wise Summary</div><table><thead><tr><th>Shift</th><th class=r>Sale (Kg)</th><th class=r>Expected</th><th class=r>Collection</th><th class=r>Shortage</th><th class=r>Balance</th></tr></thead><tbody>${sRows}</tbody></table></div>`:""}${mx.length>0?`<div class=card><div class=ch>Machine x Shift</div><table><thead><tr><th>Machine</th><th>Shift</th><th>Employee(s)</th><th class=r>Sale (Kg)</th><th class=r>Expected</th><th class=r>Collection</th><th class=r>Shortage</th><th class=r>Balance</th></tr></thead><tbody>${xRows}</tbody></table></div>`:""}<div class=card><div class=ch>Payment Mode Breakdown</div><table><thead><tr><th>Payment Mode</th><th class=r>Amount</th><th class=r>% Share</th></tr></thead><tbody>${pRows}</tbody><tfoot><tr><td><b>GRAND TOTAL</b></td><td class=r style="color:#1a6644">Rs.${gCol.toFixed(2)}</td><td class=r>100%</td></tr></tfoot></table></div>${filtered.length>1?`<div class=card><div class=ch>Day-wise Breakdown</div><table><thead><tr><th>Date</th><th class=r>Sale (Kg)</th><th class=r>CNG Rate</th><th class=r>Expected</th><th class=r>Collection</th><th class=r>Shortage</th><th class=r>Balance</th></tr></thead><tbody>${dRows}</tbody></table></div>`:""}${audit.length>0?`<div class=card><div class=cy>Audit Trail</div><table><thead><tr><th>Date</th><th>User</th><th>Role</th><th>Action</th><th>Time</th></tr></thead><tbody>${aRows}</tbody></table></div>`:""}<div class=ft>${stationTitle} &bull; Report generated ${new Date().toLocaleString("en-IN")}</div></div></body></html>`;
+      const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;
+      a.download=`CNG_Report_${range.from}${range.from!==range.to?"_to_"+range.to:""}.html`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(()=>{ URL.revokeObjectURL(url); document.body.removeChild(a); setPdfLoading(false); },1000);
+    }catch(e){ setPdfLoading(false); }
+  }
+
+  const cs={background:"#fff",borderRadius:16,overflow:"hidden",boxShadow:"0 2px 12px rgba(0,0,0,0.07)",marginBottom:14};
+  const th=(l)=>({padding:"9px 14px",fontSize:10,fontWeight:700,color:"#5a6a85",textAlign:l?"left":"right"});
+  const td=(o={})=>({padding:"10px 14px",...o});
+
+  return(
+    <div>
+      <div style={{background:"#fff",borderRadius:16,padding:"20px 22px",marginBottom:20,boxShadow:"0 2px 12px rgba(0,0,0,0.07)"}}>
+        <div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:14}}>📊 REPORT TYPE</div>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:16}}>
+          {[{k:"daily",icon:"📅",l:"Daily"},{k:"weekly",icon:"📆",l:"Weekly"},{k:"monthly",icon:"🗓️",l:"Monthly"},{k:"custom",icon:"✏️",l:"Custom"}].map(t=>(
+            <button key={t.k} onClick={()=>setRtype(t.k)} style={{background:rtype===t.k?"linear-gradient(135deg,#0f1c33,#1a3a6e)":"#f0f4f8",color:rtype===t.k?"#fff":"#5a6a85",border:rtype===t.k?"none":"1.5px solid #dde3ec",borderRadius:10,padding:"9px 20px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:FONT,display:"flex",alignItems:"center",gap:7}}><span>{t.icon}</span><span>{t.l}</span></button>
+          ))}
+        </div>
+        <div style={{display:"flex",gap:12,alignItems:"flex-end",flexWrap:"wrap"}}>
+          {rtype==="daily"&&<div><span style={lbl()}>Select Date</span><input type="date" value={selDate} onChange={e=>setSelDate(e.target.value)} style={inp({width:200})}/></div>}
+          {rtype==="weekly"&&<div style={{background:"#f0f4f8",borderRadius:10,padding:"10px 16px"}}><div style={{fontSize:11,fontWeight:700,color:"#5a6a85",marginBottom:2}}>CURRENT WEEK</div><div style={{fontWeight:800,color:"#1a2740"}}>{fmtDate(wk.from)} — {fmtDate(wk.to)}</div></div>}
+          {rtype==="monthly"&&<div style={{background:"#f0f4f8",borderRadius:10,padding:"10px 16px"}}><div style={{fontSize:11,fontWeight:700,color:"#5a6a85",marginBottom:2}}>CURRENT MONTH</div><div style={{fontWeight:800,color:"#1a2740"}}>{new Date(mo.from+"T00:00:00").toLocaleDateString("en-IN",{month:"long",year:"numeric"})}</div></div>}
+          {rtype==="custom"&&<><div><span style={lbl()}>From</span><input type="date" value={cFrom} onChange={e=>setCFrom(e.target.value)} style={inp({width:180})}/></div><div><span style={lbl()}>To</span><input type="date" value={cTo} min={cFrom} onChange={e=>setCTo(e.target.value)} style={inp({width:180})}/></div></>}
+          <button onClick={()=>setShowFilters(p=>!p)} style={{background:showFilters?"linear-gradient(135deg,#0f4c81,#3b9edd)":"#f0f4f8",color:showFilters?"#fff":"#5a6a85",border:showFilters?"none":"1.5px solid #dde3ec",borderRadius:10,padding:"9px 18px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:FONT,display:"flex",alignItems:"center",gap:6}}>
+            <span>🔧</span><span>Filters</span>
+            {(selShifts.length<SHIFTS.length||selMachines.length<MACHINES.length)&&<span style={{background:"#e53935",color:"#fff",borderRadius:99,fontSize:10,fontWeight:800,padding:"1px 6px",marginLeft:2}}>{(SHIFTS.length-selShifts.length)+(MACHINES.length-selMachines.length)}</span>}
+          </button>
+          <button onClick={buildAndDownload} disabled={pdfLoading} style={{background:pdfLoading?"#bbb":"linear-gradient(135deg,#f4a827,#e8941a)",border:"none",color:"#fff",borderRadius:10,padding:"9px 20px",fontSize:13,fontWeight:800,cursor:pdfLoading?"not-allowed":"pointer",fontFamily:FONT,marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
+            <span>{pdfLoading?"⏳":"📄"}</span><span>{pdfLoading?"Generating...":"Download Report"}</span>
+          </button>
+        </div>
+        {showFilters&&(
+          <div style={{background:"#f7f9fc",borderRadius:12,padding:"16px 18px",marginTop:14,border:"1.5px solid #dde3ec"}}>
+            <div style={{display:"flex",gap:32,flexWrap:"wrap"}}>
+              <div><div style={{fontSize:10,fontWeight:700,color:"#5a6a85",letterSpacing:1.2,marginBottom:10}}>MACHINES</div><div style={{display:"flex",gap:8}}>{MACHINES.map(m=>{ const col=MACHINE_COLORS[m],act=selMachines.includes(m); return(<button key={m} onClick={()=>togMachine(m)} style={{background:act?`linear-gradient(135deg,${col.bg},${col.accent})`:"#fff",color:act?"#fff":"#5a6a85",border:`1.5px solid ${act?col.accent:"#dde3ec"}`,borderRadius:9,padding:"7px 18px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>M{m}</button>); })}</div></div>
+              <div><div style={{fontSize:10,fontWeight:700,color:"#5a6a85",letterSpacing:1.2,marginBottom:10}}>SHIFTS</div><div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{SHIFTS.map(s=>{ const act=selShifts.includes(s); return(<button key={s} onClick={()=>togShift(s)} style={{background:act?SHIFT_COLORS[s]:"#fff",color:act?"#fff":"#5a6a85",border:`1.5px solid ${act?SHIFT_COLORS[s]:"#dde3ec"}`,borderRadius:9,padding:"7px 16px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>{s}</button>); })}</div></div>
+              <div style={{alignSelf:"flex-end"}}><button onClick={()=>{setSelShifts([...SHIFTS]);setSelMachines([...MACHINES]);}} style={{background:"#fce4e4",color:"#c62828",border:"1.5px solid #ef9a9a",borderRadius:9,padding:"7px 16px",fontSize:12.5,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>Reset</button></div>
+            </div>
+          </div>
+        )}
+      </div>
+      {filtered.length===0?(<div style={{background:"#fff",borderRadius:16,padding:"48px",textAlign:"center",boxShadow:"0 2px 12px rgba(0,0,0,0.07)"}}><div style={{fontSize:48,marginBottom:12}}>📭</div><div style={{fontSize:16,fontWeight:700,color:"#5a6a85"}}>No entries found</div></div>):(
+        <>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:16}}>
+            {[{icon:"⛽",l:"Total Sale",v:gSale.toFixed(2)+" Kg",color:"#1a3a6e",bg:"#e8f4fd"},{icon:"🎯",l:"Expected",v:"₹"+gExp.toFixed(2),color:"#7b2d8b",bg:"#f5eaf8"},{icon:"💰",l:"Collection",v:"₹"+gCol.toFixed(2),color:"#1a6644",bg:"#e6f7ef"},{icon:"⚠️",l:"Shortage",v:"₹"+gShort.toFixed(2),color:"#b5451b",bg:"#fdf0ea"}].map(c=>(
+              <div key={c.l} style={{background:c.bg,borderRadius:14,padding:"16px 18px",border:`1.5px solid ${c.color}22`}}><div style={{fontSize:20,marginBottom:5}}>{c.icon}</div><div style={{fontSize:10,fontWeight:700,color:"#5a6a85",letterSpacing:1.2,marginBottom:3}}>{c.l.toUpperCase()}</div><div style={{fontSize:19,fontWeight:900,color:c.color}}>{c.v}</div></div>
+            ))}
+          </div>
+          <div style={cs}><div style={{padding:"13px 18px",fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5}}>📊 MACHINE-WISE SUMMARY</div><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr style={{background:"#eef2f7"}}>{["Machine","Sale (Kg)","Expected","Collection","Shortage","Balance"].map((h,i)=><th key={h} style={th(i===0)}>{h}</th>)}</tr></thead><tbody>{ms.map((o,i)=>{ const col=MACHINE_COLORS[o.id],d=+(o.net-o.exp).toFixed(2); return(<tr key={o.id} style={{background:i%2===0?"#fff":"#fafbfc",borderBottom:"1px solid #f0f4f8"}}><td style={td()}><span style={{background:`linear-gradient(135deg,${col.bg},${col.accent})`,color:"#fff",borderRadius:7,padding:"3px 14px",fontWeight:800,fontSize:13}}>M{o.id}</span></td><td style={td({textAlign:"right",fontWeight:700})}>{o.sale.toFixed(2)} Kg</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a3a6e"})}>₹{o.exp.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a6644"})}>₹{o.col.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#c62828"})}>{o.short>0?"₹"+o.short.toFixed(2):"—"}</td><td style={td({textAlign:"right",fontWeight:800,color:bCol(o.net,o.exp)})}>{Math.abs(d)<0.01?"✓ Balanced":d>0?`+₹${d.toFixed(2)}`:`−₹${Math.abs(d).toFixed(2)}`}</td></tr>); })}</tbody><tfoot><tr style={{background:"#eef2f7"}}><td style={td({fontWeight:900})}>TOTAL</td><td style={td({textAlign:"right",fontWeight:900})}>{gSale.toFixed(2)} Kg</td><td style={td({textAlign:"right",fontWeight:900,color:"#1a3a6e"})}>₹{gExp.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:900,color:"#1a6644"})}>₹{gCol.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:900,color:"#c62828"})}>{gShort>0?"₹"+gShort.toFixed(2):"—"}</td><td style={td({textAlign:"right",fontWeight:900,color:bCol(gNet,gExp)})}>{Math.abs(gDiff)<0.01?"✓ Balanced":gDiff>0?`+₹${gDiff.toFixed(2)}`:`−₹${Math.abs(gDiff).toFixed(2)}`}</td></tr></tfoot></table></div>
+          {ss.length>0&&<div style={cs}><div style={{padding:"13px 18px",fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5}}>🕐 SHIFT-WISE SUMMARY</div><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr style={{background:"#eef2f7"}}>{["Shift","Sale (Kg)","Expected","Collection","Shortage","Balance"].map((h,i)=><th key={h} style={th(i===0)}>{h}</th>)}</tr></thead><tbody>{ss.map((s,i)=>{ const d=+(s.net-s.exp).toFixed(2); return(<tr key={s.shift} style={{background:i%2===0?"#fff":"#fafbfc",borderBottom:"1px solid #f0f4f8"}}><td style={td()}><span style={{background:SHIFT_COLORS[s.shift]+"22",color:SHIFT_COLORS[s.shift],borderRadius:99,padding:"3px 12px",fontSize:12,fontWeight:700}}>{s.shift}</span></td><td style={td({textAlign:"right",fontWeight:700})}>{s.sale.toFixed(2)} Kg</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a3a6e"})}>₹{s.exp.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a6644"})}>₹{s.col.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#c62828"})}>{s.short>0?"₹"+s.short.toFixed(2):"—"}</td><td style={td({textAlign:"right",fontWeight:800,color:bCol(s.net,s.exp)})}>{Math.abs(d)<0.01?"✓ Balanced":d>0?`+₹${d.toFixed(2)}`:`−₹${Math.abs(d).toFixed(2)}`}</td></tr>); })}</tbody></table></div>}
+          {mx.length>0&&<div style={cs}><div style={{padding:"13px 18px",fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5}}>🔀 MACHINE × SHIFT</div><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr style={{background:"#eef2f7"}}>{["Machine","Shift","Employee(s)","Sale (Kg)","Expected","Collection","Shortage","Balance"].map((h,i)=><th key={h} style={th(i<3)}>{h}</th>)}</tr></thead><tbody>{mx.map((r,i)=>{ const col=MACHINE_COLORS[r.machineId],d=+(r.net-r.exp).toFixed(2); return(<tr key={r.machineId+r.shift} style={{background:i%2===0?"#fff":"#fafbfc",borderBottom:"1px solid #f0f4f8"}}><td style={td()}><span style={{background:`linear-gradient(135deg,${col.bg},${col.accent})`,color:"#fff",borderRadius:6,padding:"2px 12px",fontWeight:800,fontSize:12}}>M{r.machineId}</span></td><td style={td()}><span style={{background:SHIFT_COLORS[r.shift]+"22",color:SHIFT_COLORS[r.shift],borderRadius:99,padding:"2px 10px",fontSize:11.5,fontWeight:700}}>{r.shift}</span></td><td style={td({fontSize:12,color:"#5a6a85"})}>{r.emps}</td><td style={td({textAlign:"right",fontWeight:700})}>{r.sale.toFixed(2)} Kg</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a3a6e"})}>₹{r.exp.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a6644"})}>₹{r.col.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#c62828"})}>{r.short>0?"₹"+r.short.toFixed(2):"—"}</td><td style={td({textAlign:"right",fontWeight:800,color:bCol(r.net,r.exp)})}>{Math.abs(d)<0.01?"✓":d>0?`+₹${d.toFixed(2)}`:`−₹${Math.abs(d).toFixed(2)}`}</td></tr>); })}</tbody></table></div>}
+          <div style={cs}><div style={{padding:"13px 18px",fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5}}>💳 PAYMENT BREAKDOWN</div><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr style={{background:"#eef2f7"}}>{["Payment Mode","Amount","% Share"].map((h,i)=><th key={h} style={th(i===0)}>{h}</th>)}</tr></thead><tbody>{PAYMENT_METHODS.map((m,i)=>{ const icons={Cash:"💵","PhonePay / GPay":"📱","Credit Card":"💳","Debit Card":"🏧",Petrocard:"⛽"},pct=gCol>0?((mw[m]/gCol)*100).toFixed(1):"0.0"; return(<tr key={m} style={{background:i%2===0?"#fff":"#fafbfc",borderBottom:"1px solid #f0f4f8"}}><td style={td({fontWeight:600})}>{icons[m]} {m}</td><td style={td({fontWeight:800,textAlign:"right"})}>₹{mw[m].toFixed(2)}</td><td style={td({textAlign:"right"})}><span style={{background:"#eef2f7",borderRadius:99,padding:"3px 10px",fontSize:12,fontWeight:700,color:"#5a6a85"}}>{pct}%</span></td></tr>); })}</tbody><tfoot><tr style={{background:"#eef2f7"}}><td style={td({fontWeight:900})}>GRAND TOTAL</td><td style={td({textAlign:"right",fontWeight:900,color:"#1a6644"})}>₹{gCol.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:900})}>100%</td></tr></tfoot></table></div>
+          {filtered.length>1&&<div style={cs}><div style={{padding:"13px 18px",fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5}}>📅 DAY-WISE BREAKDOWN</div><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr style={{background:"#eef2f7"}}>{["Date","Sale (Kg)","CNG Rate","Expected","Collection","Shortage","Balance"].map((h,i)=><th key={h} style={th(i===0)}>{h}</th>)}</tr></thead><tbody>{filtered.map((r,i)=>{ const e=r.entries||[],s=e.reduce((s,e)=>s+calcEntrySale(e),0),c=e.reduce((s,e)=>s+calcEntryCollection(e),0),sh=e.reduce((s,e)=>s+calcEntryShortage(e),0),rt=parseFloat(r.cngRate)||0,ex=+(s*rt).toFixed(2),nt=+(c-sh).toFixed(2),d=+(nt-ex).toFixed(2); return(<tr key={r.date} style={{background:i%2===0?"#fff":"#fafbfc",borderBottom:"1px solid #f0f4f8"}}><td style={td({fontWeight:600})}>{fmtDate(r.date)}</td><td style={td({textAlign:"right",fontWeight:700})}>{s.toFixed(2)}</td><td style={td({textAlign:"right",color:"#5a6a85"})}>₹{rt}/Kg</td><td style={td({textAlign:"right",color:"#1a3a6e",fontWeight:700})}>₹{ex.toFixed(2)}</td><td style={td({textAlign:"right",fontWeight:700,color:"#1a6644"})}>₹{c.toFixed(2)}</td><td style={td({textAlign:"right",color:"#c62828",fontWeight:700})}>{sh>0?"₹"+sh.toFixed(2):"—"}</td><td style={td({textAlign:"right",fontWeight:800,color:bCol(nt,ex)})}>{Math.abs(d)<0.01?"✓":d>0?`+₹${d.toFixed(2)}`:`−₹${Math.abs(d).toFixed(2)}`}</td></tr>); })}</tbody></table></div>}
+          {audit.length>0&&<div style={cs}><div style={{padding:"13px 18px",fontSize:10.5,fontWeight:700,color:"#f57f17",letterSpacing:1.5}}>🔍 AUDIT TRAIL</div><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr style={{background:"#fff8e1"}}>{["Date","User","Role","Action","Time"].map(h=><th key={h} style={{padding:"9px 12px",fontSize:10,fontWeight:700,color:"#f57f17",textAlign:"left"}}>{h}</th>)}</tr></thead><tbody>{audit.slice(0,100).map((e,i)=>(<tr key={i} style={{background:i%2===0?"#fff":"#fffdf5",borderBottom:"1px solid #fff8e1"}}><td style={{padding:"8px 12px",fontSize:12}}>{fmtDate(e.date)}</td><td style={{padding:"8px 12px",fontWeight:700}}>{e.displayName||"—"}</td><td style={{padding:"8px 12px"}}><span style={{background:"#e8f4fd",color:"#0f4c81",borderRadius:99,padding:"2px 10px",fontSize:11,fontWeight:700}}>{(e.role||"").toUpperCase()}</span></td><td style={{padding:"8px 12px",color:"#5a6a85",fontSize:12}}>{e.action||"—"}</td><td style={{padding:"8px 12px",fontSize:11,color:"#5a6a85"}}>{fmtDT(e.at)}</td></tr>))}</tbody></table></div>}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+export default function App(){
+  const [users,setUsers]=useState(DEFAULT_USERS);
+  const [currentUser,setCurrentUser]=useState(null);
+  const [allRecords,setAllRecords]=useState([]);
+  const [stationTitle,setStationTitle]=useState(STATION_TITLE_DEFAULT);
+  const [date,setDate]=useState(todayStr());
+  const [cngRate,setCngRate]=useState(DEFAULT_CNG_RATE);
+  const [entries,setEntries]=useState([]);
+  const [draftEntries,setDraftEntries]=useState({});
+  const [auditLog,setAuditLog]=useState([]);
+  const [activeView,setActiveView]=useState("overview");
+  const [activeMachine,setActiveMachine]=useState("1");
+  const [activeShifts,setActiveShifts]=useState({"1":"Morning","2":"Morning"});
+  const [sidebarOpen,setSidebarOpen]=useState(false);
+  const [toast,setToast]=useState(null);
+
+  useEffect(()=>{
+    (async()=>{ try{ const r=await window.storage.get(STORAGE_KEY); if(r?.value){ const d=JSON.parse(r.value); setAllRecords(d.records||[]); setStationTitle(d.stationTitle||STATION_TITLE_DEFAULT); setUsers(mergeUsers(d.users)); } }catch{} })();
+  },[]);
+
+  useEffect(()=>{
+    if(!currentUser)return;
+    const rec=allRecords.find(r=>r.date===date);
+    setEntries(rec?.entries||[]);
+    setCngRate(rec?.cngRate??DEFAULT_CNG_RATE);
+    setAuditLog(rec?.auditLog||[]);
+    setDraftEntries({});
+  },[date,allRecords,currentUser]);
+
+  function showToast(msg,color="#1a3a6e"){ setToast({msg,color}); setTimeout(()=>setToast(null),2800); }
+
+  const activeShift=activeShifts[activeMachine]||"Morning";
+  const draftKey=`${activeMachine}_${activeShift}`;
+
+  const sameDayPrev=getPrevClosingSameDay(entries,activeMachine,activeShift);
+  const prevDayClosing=useMemo(()=>getLastClosingBeforeDate(allRecords,activeMachine,date),[allRecords,activeMachine,date]);
+  const prevClosing=sameDayPrev||prevDayClosing;
+  const prevClosingSource=sameDayPrev?"sameDay":(prevDayClosing?"prevDay":null);
+
+  const savedEntry=getEntry(entries,activeMachine,activeShift);
+  const isFresh=!draftEntries[draftKey]&&!savedEntry;
+
+  const displayEntry=useMemo(()=>{
+    if(draftEntries[draftKey]) return draftEntries[draftKey];
+    if(savedEntry) return savedEntry;
+    return emptyShiftEntry(activeMachine,activeShift,prevClosing?.A||"",prevClosing?.B||"");
+  },[draftKey,draftEntries,savedEntry,prevClosing,activeMachine,activeShift]);
+
+  function updateDraft(updated){ setDraftEntries(prev=>({...prev,[draftKey]:updated})); }
+  function handleShiftChange(newShift){ setActiveShifts(prev=>({...prev,[activeMachine]:newShift})); }
+
+  async function saveEntry(){
+    const toSave=draftEntries[draftKey]||savedEntry;
+    if(!toSave||isEntryEmpty(toSave)){ showToast("Nothing to save — entry is empty","#f57f17"); return; }
+    const action=savedEntry?`Modified M${activeMachine} ${activeShift} for ${fmtDate(date)}`:`Created M${activeMachine} ${activeShift} for ${fmtDate(date)}`;
+    const logEntry={displayName:currentUser.displayName,username:currentUser.username,role:currentUser.role,action,machineId:activeMachine,shift:activeShift,at:nowISO()};
+    const newLog=[...auditLog,logEntry];
+    setAuditLog(newLog);
+    const newEntries=[...entries.filter(e=>!(e.machineId===activeMachine&&e.shift===activeShift)),{...toSave,machineId:activeMachine,shift:activeShift}];
+    const updated=allRecords.filter(r=>r.date!==date);
+    updated.push({date,cngRate,entries:newEntries,auditLog:newLog});
+    updated.sort((a,b)=>a.date.localeCompare(b.date));
+    try{
+      await window.storage.set(STORAGE_KEY,JSON.stringify({records:updated,stationTitle,users}));
+      setAllRecords(updated); setEntries(newEntries);
+      setDraftEntries(prev=>{ const n={...prev}; delete n[draftKey]; return n; });
+      showToast(`✓ M${activeMachine} ${activeShift} saved`,MACHINE_COLORS[activeMachine].bg);
+    }catch{ showToast("Save failed","#c62828"); }
+  }
+
+  async function resetEntry(){
+    setDraftEntries(prev=>{ const n={...prev}; delete n[draftKey]; return n; });
+    const action=`Reset M${activeMachine} ${activeShift} for ${fmtDate(date)}`;
+    const logEntry={displayName:currentUser.displayName,username:currentUser.username,role:currentUser.role,action,machineId:activeMachine,shift:activeShift,at:nowISO()};
+    const newLog=[...auditLog,logEntry];
+    setAuditLog(newLog);
+    const newEntries=entries.filter(e=>!(e.machineId===activeMachine&&e.shift===activeShift));
+    setEntries(newEntries);
+    const dayExists=allRecords.find(r=>r.date===date);
+    if(dayExists){
+      const updated=allRecords.filter(r=>r.date!==date);
+      if(newEntries.length>0) updated.push({date,cngRate,entries:newEntries,auditLog:newLog});
+      updated.sort((a,b)=>a.date.localeCompare(b.date));
+      try{ await window.storage.set(STORAGE_KEY,JSON.stringify({records:updated,stationTitle,users})); setAllRecords(updated); }catch{}
+    }
+    showToast(`✓ M${activeMachine} ${activeShift} reset`,"#f57f17");
+  }
+
+  async function persistUsers(nu){ setUsers(nu); try{ await window.storage.set(STORAGE_KEY,JSON.stringify({records:allRecords,stationTitle,users:nu})); }catch{} }
+
+  const isHistoric=!isToday(date)&&!isFutureDate(date);
+  const isFuture=isFutureDate(date);
+  const isReadOnly=currentUser?.role==="operator"&&(isHistoric||isFuture);
+  const roleColor={admin:"#0f4c81",manager:"#7b2d8b",operator:"#1a6644"};
+  const NAV=[{k:"overview",icon:"📊",label:"Overview"},{k:"entry",icon:"✏️",label:"Daily Entry"},{k:"reports",icon:"📋",label:"Reports"},...(currentUser?.role==="admin"?[{k:"users",icon:"👥",label:"Users"},{k:"settings",icon:"⚙️",label:"Settings"}]:[])];
+
+  if(!currentUser) return <LoginScreen onLogin={setCurrentUser} users={users}/>;
+
+  return(
+    <div style={{minHeight:"100vh",background:"#eef2f7",fontFamily:FONT,display:"flex",flexDirection:"column"}}>
+      <div style={{background:"linear-gradient(90deg,#0f1c33,#1a3a6e)",padding:"14px 24px",boxShadow:"0 3px 20px rgba(0,0,0,0.25)",display:"flex",alignItems:"center",gap:16,flexShrink:0}}>
+        <SwamiBadge size={48}/>
+        <div style={{flex:1}}>
+          <input value={stationTitle} onChange={e=>setStationTitle(e.target.value)} style={{background:"transparent",border:"none",color:"#fff",fontSize:18,fontWeight:900,outline:"none",width:"100%",fontFamily:FONT}}/>
+          <div style={{color:"rgba(255,255,255,0.38)",fontSize:10,fontWeight:700,letterSpacing:1.5}}>⛽ CNG STATION MANAGEMENT SYSTEM</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,background:"rgba(255,255,255,0.1)",borderRadius:10,padding:"7px 14px",border:"1px solid rgba(255,255,255,0.15)"}}>
+          <div style={{width:32,height:32,borderRadius:"50%",background:`linear-gradient(135deg,${roleColor[currentUser.role]},${roleColor[currentUser.role]}88)`,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,color:"#fff",fontSize:14}}>{currentUser.displayName?.[0]}</div>
+          <div><div style={{color:"#fff",fontWeight:700,fontSize:13}}>{currentUser.displayName}</div><div style={{fontSize:9.5,color:"rgba(255,255,255,0.45)",fontWeight:700,letterSpacing:1}}>{currentUser.role.toUpperCase()}</div></div>
+        </div>
+        <button onClick={()=>setCurrentUser(null)} style={{background:"rgba(255,80,80,0.2)",border:"1.5px solid rgba(255,100,100,0.35)",color:"#ffaaaa",borderRadius:9,padding:"8px 16px",fontSize:12.5,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>Sign Out</button>
+      </div>
+
+      <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+        <div style={{width:sidebarOpen?200:56,background:"#fff",borderRight:"1.5px solid #e4e9f0",display:"flex",flexDirection:"column",flexShrink:0,transition:"width 0.22s ease",overflow:"hidden",boxShadow:"2px 0 12px rgba(0,0,0,0.05)"}}>
+          <button onClick={()=>setSidebarOpen(o=>!o)} style={{margin:"12px auto 8px",width:36,height:36,borderRadius:10,border:"1.5px solid #e4e9f0",background:"#f7f9fc",cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,color:"#5a6a85"}}>{sidebarOpen?"✕":"☰"}</button>
+          <div style={{padding:"4px 8px"}}>{NAV.map(n=>{ const active=activeView===n.k; return(<button key={n.k} onClick={()=>{setActiveView(n.k);setSidebarOpen(false);}} style={{width:"100%",display:"flex",alignItems:"center",gap:sidebarOpen?10:0,justifyContent:sidebarOpen?"flex-start":"center",padding:"11px",marginBottom:4,borderRadius:10,border:"none",background:active?"linear-gradient(135deg,#0f4c81,#3b9edd)":"transparent",color:active?"#fff":"#5a6a85",fontWeight:700,fontSize:13.5,cursor:"pointer",fontFamily:FONT,transition:"all 0.15s"}} title={!sidebarOpen?n.label:""}><span style={{fontSize:18,flexShrink:0}}>{n.icon}</span>{sidebarOpen&&<span style={{whiteSpace:"nowrap"}}>{n.label}</span>}</button>); })}</div>
+        </div>
+
+        <div style={{flex:1,overflowY:"auto",minWidth:0}}>
+          {activeView==="overview"&&<div style={{padding:"28px 28px 40px"}}><div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:20}}>📊 OVERVIEW — {fmtDate(date)}</div><DayOverview entries={entries} date={date} cngRate={cngRate}/></div>}
+
+          {activeView==="entry"&&(
+            <div style={{paddingBottom:40}}>
+              <div style={{background:"#fff",borderBottom:"1.5px solid #e4e9f0",padding:"12px 24px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",position:"sticky",top:0,zIndex:10,boxShadow:"0 2px 8px rgba(0,0,0,0.05)"}}>
+                <div style={{fontSize:13,fontWeight:700,color:"#1a2740"}}>✏️ Daily Entry</div>
+                <div style={{width:1,height:22,background:"#dde3ec"}}/>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:11,fontWeight:700,color:"#5a6a85",letterSpacing:1}}>DATE</span><input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{border:"1.5px solid #dde3ec",borderRadius:8,padding:"6px 10px",fontSize:13,fontFamily:FONT,color:"#1a2740",background:"#f7f9fc",outline:"none"}}/></div>
+                <div style={{width:1,height:22,background:"#dde3ec"}}/>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:11,fontWeight:700,color:"#5a6a85",letterSpacing:1}}>CNG RATE (₹/Kg)</span><input type="number" min="0" value={cngRate} onChange={e=>setCngRate(e.target.value)} style={{border:"1.5px solid #dde3ec",borderRadius:8,padding:"6px 10px",fontSize:13,fontFamily:FONT,color:"#1a2740",background:"#fff8e1",outline:"none",width:90,fontWeight:700}}/></div>
+                {isHistoric&&<span style={{background:"#fff8e1",border:"1.5px solid #ffe082",color:"#f57f17",borderRadius:8,padding:"4px 12px",fontSize:11,fontWeight:700}}>{isReadOnly?"👁 View Only":"⚠️ Past Entry"}</span>}
+                {isFuture&&<span style={{background:"#f5eaf8",border:"1.5px solid #ce93d8",color:"#7b2d8b",borderRadius:8,padding:"4px 12px",fontSize:11,fontWeight:700}}>🔮 Future Entry — {fmtDate(date)}</span>}
+              </div>
+
+              <div style={{background:"#fff",borderBottom:"1.5px solid #e4e9f0",padding:"10px 24px",display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+                <span style={{fontSize:11,fontWeight:700,color:"#5a6a85",letterSpacing:1}}>MACHINE</span>
+                {MACHINES.map(id=>{ const col=MACHINE_COLORS[id],act=activeMachine===id; return(<button key={id} onClick={()=>setActiveMachine(id)} style={{background:act?`linear-gradient(135deg,${col.bg},${col.accent})`:"#f0f4f8",color:act?"#fff":"#5a6a85",border:act?"none":"1.5px solid #dde3ec",borderRadius:9,padding:"7px 18px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:FONT}}>M{id}</button>); })}
+                <div style={{width:1,height:22,background:"#dde3ec"}}/>
+                <span style={{fontSize:11,fontWeight:700,color:"#5a6a85",letterSpacing:1}}>SAVED</span>
+                {SHIFTS.map(s=>{ const saved=getEntry(entries,activeMachine,s),isDraft=!!draftEntries[`${activeMachine}_${s}`]; if(!saved&&!isDraft)return null; return(<span key={s} onClick={()=>setActiveShifts(prev=>({...prev,[activeMachine]:s}))} style={{background:activeShift===s?SHIFT_COLORS[s]:SHIFT_COLORS[s]+"22",color:activeShift===s?"#fff":SHIFT_COLORS[s],border:`1.5px solid ${SHIFT_COLORS[s]}`,borderRadius:99,padding:"3px 12px",fontSize:11,fontWeight:700,cursor:"pointer"}}>{s}{isDraft?" *":""}</span>); })}
+              </div>
+
+              {isHistoric&&!isReadOnly&&<div style={{background:"#fce4e4",borderLeft:"4px solid #c62828",padding:"10px 24px",fontSize:12.5,fontWeight:600,color:"#c62828"}}>✏️ Editing past entry for {fmtDate(date)}. Changes will be logged.</div>}
+              {isFuture&&!isReadOnly&&<div style={{background:"#f5eaf8",borderLeft:"4px solid #7b2d8b",padding:"10px 24px",fontSize:12.5,fontWeight:600,color:"#7b2d8b"}}>🔮 Editing future entry for {fmtDate(date)}. Changes will be logged.</div>}
+              {isReadOnly&&<div style={{background:"#fff8e1",borderLeft:"4px solid #f57f17",padding:"10px 24px",fontSize:12.5,fontWeight:600,color:"#e65100"}}>⚠️ Past/future entries are read-only for operators.</div>}
+
+              <div style={{padding:"20px 24px"}}>
+                <ShiftEntryCard
+                  entry={displayEntry}
+                  activeShift={activeShift}
+                  onChange={isReadOnly?()=>{}:updateDraft}
+                  onShiftChange={isReadOnly?()=>{}:handleShiftChange}
+                  onSave={isReadOnly?null:saveEntry}
+                  onReset={isReadOnly?null:resetEntry}
+                  cngRate={cngRate}
+                  auditLog={auditLog}
+                  isHistoric={isHistoric}
+                  isReadOnly={isReadOnly}
+                  prevClosing={prevClosing}
+                  source={prevClosingSource}
+                  isFresh={isFresh}
+                />
+              </div>
+            </div>
+          )}
+
+          {activeView==="reports"&&<div style={{padding:"28px 28px 40px"}}><div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:20}}>📋 REPORTS</div><ReportsView allRecords={allRecords} stationTitle={stationTitle}/></div>}
+          {activeView==="users"&&currentUser.role==="admin"&&<div style={{padding:"28px 28px 40px"}}><div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:20}}>👥 USER MANAGEMENT</div><UserManager users={users} setUsers={persistUsers} currentUser={currentUser}/></div>}
+          {activeView==="settings"&&currentUser.role==="admin"&&<div style={{padding:"28px 28px 40px"}}><div style={{fontSize:10.5,fontWeight:700,color:"#5a6a85",letterSpacing:1.5,marginBottom:20}}>⚙️ ACCOUNT SETTINGS</div><ChangeCredentials currentUser={currentUser} users={users} setUsers={persistUsers} setCurrentUser={setCurrentUser} showToast={showToast}/></div>}
+        </div>
+      </div>
+
+      {toast&&<div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",background:toast.color,color:"#fff",borderRadius:12,padding:"12px 26px",fontWeight:700,fontSize:14,fontFamily:FONT,boxShadow:"0 6px 24px rgba(0,0,0,0.25)",zIndex:9999,whiteSpace:"nowrap"}}>{toast.msg}</div>}
+      <style>{`input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}input:focus,select:focus{border-color:#3b9edd!important;box-shadow:0 0 0 3px rgba(59,158,221,0.15)}*{box-sizing:border-box}`}</style>
+    </div>
+  );
+}
